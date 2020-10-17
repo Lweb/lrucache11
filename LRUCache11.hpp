@@ -1,11 +1,6 @@
 /*
  * LRUCache11 - a templated C++11 based LRU cache class that allows
- * specification of
- * key, value and optionally the map container type (defaults to
- * std::unordered_map)
- * By using the std::unordered_map and a linked list of keys it allows O(1) insert, delete
- * and
- * refresh operations.
+ * specification of key, value
  *
  * This is a header-only library and all you need is the LRUCache11.hpp file
  *
@@ -29,180 +24,137 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #pragma once
+
 #include <algorithm>
 #include <cstdint>
 #include <list>
 #include <mutex>
-#include <stdexcept>
-#include <thread>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace lru11 {
-/*
- * a noop lockable concept that can be used in place of std::mutex
- */
-class NullLock {
- public:
-  void lock() {}
-  void unlock() {}
-  bool try_lock() { return true; }
-};
+  template<typename K, typename V>
+  struct KeyValuePair {
+    K key;
+    V value;
+
+    KeyValuePair(K k, V v) : key(std::move(k)), value(std::move(v)) {}
+  };
 
 /**
- * error raised when a key not in cache is passed to get()
+ * Cache is a thread-safe hashtable with a limited size. When it is full, insert()
+ * evicts the least recently used item from the cache.
+ * Cache uses a read write lock for the inner map and a write lock for the inner
+ * list. The acquisition of the list lock during get() operation is non-blocking (try_lock),
+ * so under heavy lookup load, the container will not stall, instead some LRU update operations
+ * will be omitted.
  */
-class KeyNotFound : public std::invalid_argument {
- public:
-  KeyNotFound() : std::invalid_argument("key_not_found") {}
-};
+  template<class Key, class Value>
+  class Cache {
+  public:
+    using node_type = KeyValuePair<Key, Value>;
+    using map_type = std::unordered_map<Key, typename std::list<node_type>::iterator>;
+    using list_type = std::list<node_type>;
 
-template <typename K, typename V>
-struct KeyValuePair {
- public:
-  K key;
-  V value;
+    // disallow copying
+    Cache(const Cache&) = delete;
+    Cache& operator=(const Cache&) = delete;
 
-  KeyValuePair(K k, V v) : key(std::move(k)), value(std::move(v)) {}
-};
+    /**
+     * @param maxSize maxSize = 0 means unbounded capacity
+     */
+    explicit Cache(size_t maxSize = 64) : maxSize_(maxSize) {}
 
-/**
- *	The LRU Cache class templated by
- *		Key - key type
- *		Value - value type
- *		MapType - an associative container like std::unordered_map
- *		LockType - a lock type derived from the Lock class (default:
- *NullLock = no synchronization)
- *
- *	The default NullLock based template is not thread-safe, however passing
- *Lock=std::mutex will make it
- *	thread-safe
- */
-template <class Key, class Value, class Lock = NullLock,
-          class Map = std::unordered_map<
-              Key, typename std::list<KeyValuePair<Key, Value>>::iterator>>
-class Cache {
- public:
-  typedef KeyValuePair<Key, Value> node_type;
-  typedef std::list<KeyValuePair<Key, Value>> list_type;
-  typedef Map map_type;
-  typedef Lock lock_type;
-  using Guard = std::lock_guard<lock_type>;
-  /**
-   * the maxSize is the soft limit of keys and (maxSize + elasticity) is the
-   * hard limit
-   * the cache is allowed to grow till (maxSize + elasticity) and is pruned back
-   * to maxSize keys
-   * set maxSize = 0 for an unbounded cache (but in that case, you're better off
-   * using a std::unordered_map
-   * directly anyway! :)
-   */
-  explicit Cache(size_t maxSize = 64, size_t elasticity = 10)
-      : maxSize_(maxSize), elasticity_(elasticity) {}
-  virtual ~Cache() = default;
-  size_t size() const {
-    Guard g(lock_);
-    return cache_.size();
-  }
-  bool empty() const {
-    Guard g(lock_);
-    return cache_.empty();
-  }
-  void clear() {
-    Guard g(lock_);
-    cache_.clear();
-    keys_.clear();
-  }
-  void insert(const Key& k, Value v) {
-    Guard g(lock_);
-    const auto iter = cache_.find(k);
-    if (iter != cache_.end()) {
-      iter->second->value = v;
-      keys_.splice(keys_.begin(), keys_, iter->second);
-      return;
+    virtual ~Cache() = default;
+
+    void clear() {
+      std::lock_guard<std::shared_mutex> mapWriteLock(mapMtx_);
+      std::lock_guard<std::mutex> listWriteLock(listMtx_);
+      map_.clear();
+      list_.clear();
     }
 
-    keys_.emplace_front(k, std::move(v));
-    cache_[k] = keys_.begin();
-    prune();
-  }
-  bool tryGet(const Key& kIn, Value& vOut) {
-    Guard g(lock_);
-    const auto iter = cache_.find(kIn);
-    if (iter == cache_.end()) {
-      return false;
-    }
-    keys_.splice(keys_.begin(), keys_, iter->second);
-    vOut = iter->second->value;
-    return true;
-  }
-  /**
-   *	The const reference returned here is only
-   *    guaranteed to be valid till the next insert/delete
-   */
-  const Value& get(const Key& k) {
-    Guard g(lock_);
-    const auto iter = cache_.find(k);
-    if (iter == cache_.end()) {
-      throw KeyNotFound();
-    }
-    keys_.splice(keys_.begin(), keys_, iter->second);
-    return iter->second->value;
-  }
-  /**
-   * returns a copy of the stored object (if found)
-   */
-  Value getCopy(const Key& k) {
-   return get(k);
-  }
-  bool remove(const Key& k) {
-    Guard g(lock_);
-    auto iter = cache_.find(k);
-    if (iter == cache_.end()) {
-      return false;
-    }
-    keys_.erase(iter->second);
-    cache_.erase(iter);
-    return true;
-  }
-  bool contains(const Key& k) const {
-    Guard g(lock_);
-    return cache_.find(k) != cache_.end();
-  }
+    /**
+     * insert will store the copy of the key and value
+     */
+    void insert(const Key& key, const Value& value) {
+      std::lock_guard<std::shared_mutex> mapWriteLock(mapMtx_);
+      std::lock_guard<std::mutex> listWriteLock(listMtx_);
+      const auto iter = map_.find(key);
+      if (iter != map_.end()) {
+        iter->second->value = value;
+        list_.splice(list_.begin(), list_, iter->second);
+        return;
+      }
 
-  size_t getMaxSize() const { return maxSize_; }
-  size_t getElasticity() const { return elasticity_; }
-  size_t getMaxAllowedSize() const { return maxSize_ + elasticity_; }
-  template <typename F>
-  void cwalk(F& f) const {
-    Guard g(lock_);
-    std::for_each(keys_.begin(), keys_.end(), f);
-  }
-
- protected:
-  size_t prune() {
-    size_t maxAllowed = maxSize_ + elasticity_;
-    if (maxSize_ == 0 || cache_.size() < maxAllowed) {
-      return 0;
+      list_.emplace_front(key, value);
+      map_[key] = list_.begin();
+      prune();
     }
-    size_t count = 0;
-    while (cache_.size() > maxSize_) {
-      cache_.erase(keys_.back().key);
-      keys_.pop_back();
-      ++count;
+
+    /**
+     * @return a optional of the copy from the stored value (if found),
+     * using Value = shared_ptr to achieve reference semantics
+     */
+    std::optional<Value> get(const Key& key) {
+      std::shared_lock<std::shared_mutex> mapReadLock(mapMtx_);
+      const auto iter = map_.find(key);
+      if (iter == map_.end()) {
+        return std::optional<Value> {};
+      }
+      tryPromote(iter->second);
+      return std::make_optional<Value>(iter->second->value);
     }
-    return count;
-  }
 
- private:
-  // Disallow copying.
-  Cache(const Cache&) = delete;
-  Cache& operator=(const Cache&) = delete;
+    /**
+     * if key is not in cache, insert this key to cache with the value
+     * generated by the supplier
+     */
+    Value getWithSupplier(const Key& key, const std::function<Value()>& supplier) {
+      std::lock_guard<std::shared_mutex> mapWriteLock(mapMtx_);
+      std::lock_guard<std::mutex> listWriteLock(listMtx_);
+      const auto iter = map_.find(key);
+      if (iter != map_.end()) {
+        list_.splice(list_.begin(), list_, iter->second);
+        return iter->second->value;
+      }
 
-  mutable Lock lock_;
-  Map cache_;
-  list_type keys_;
-  size_t maxSize_;
-  size_t elasticity_;
-};
+      Value value = supplier();
+      list_.emplace_front(key, value);
+      map_[key] = list_.begin();
+      prune();
+      return value;
+    }
+
+    size_t getMaxSize() const { return maxSize_; }
+
+  protected:
+    size_t prune() {
+      if (maxSize_ == 0 || map_.size() < maxSize_) {
+        return 0;
+      }
+      size_t count = 0;
+      while (map_.size() > maxSize_) {
+        map_.erase(list_.back().key);
+        list_.pop_back();
+        ++count;
+      }
+      return count;
+    }
+
+    void tryPromote(typename list_type::iterator iter) {
+      std::unique_lock<std::mutex> listWriteLock(listMtx_, std::try_to_lock);
+      if (listWriteLock) {
+        list_.splice(list_.begin(), list_, iter);
+      }
+    }
+
+  private:
+    mutable std::shared_mutex mapMtx_;
+    mutable std::mutex listMtx_;
+    map_type map_;
+    list_type list_;
+    size_t maxSize_;
+  };
 
 }  // namespace LRUCache11
